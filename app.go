@@ -176,7 +176,7 @@ func saveResults(IP, Username, Password string) error {
 	return nil
 }
 
-func saveError(IP, errorMsg string) error {
+func saveError(IP string) error {
 	errorsFile, err := openErrorsFile()
 	if err != nil {
 		return err
@@ -217,6 +217,7 @@ func generatePasswords(parlai, urlai string, ctx context.Context) <-chan string 
 	passwordsChan := make(chan string)
 
 	go func() {
+		defer func() { recover() }()
 		defer func() {
 			_ = file.Close()
 			_ = os.Remove(parlai)
@@ -253,7 +254,7 @@ func generateRandomNumber() int {
 func processCredsForIP(parentCtx context.Context, ip string, workers int) error {
 	users, err := ExtractingUser(parentCtx, ip)
 	if err != nil {
-		if saveErr := saveError(ip, err.Error()); saveErr != nil {
+		if saveErr := saveError(ip); saveErr != nil {
 			// Failed to save error
 		}
 		return nil
@@ -270,6 +271,7 @@ func processCredsForIP(parentCtx context.Context, ip string, workers int) error 
 
 	for i := 0; i < workers; i++ {
 		go func(workerID int) {
+			defer func() { recover() }()
 			defer wg.Done()
 			for {
 				select {
@@ -364,6 +366,7 @@ func scanIPsFromFile(ctxMenu context.Context, ipFile string, ipWorkers int, proc
 
 	for i := 0; i < ipWorkers; i++ {
 		go func(workerID int) {
+			defer func() { recover() }()
 			defer wg.Done()
 			for {
 				select {
@@ -494,7 +497,7 @@ func main() {
 	Data.TotalIP = total
 
 	//   Menu: Set number of workers
-	ipWorkers := 50
+	ipWorkers := 100
 
 	processFunc := func(ctx context.Context, ip string, workers int) error {
 		return processCredsForIP(ctx, ip, workers)
